@@ -4,10 +4,8 @@ import importlib.util
 import os
 import subprocess
 import sys
-import threading
 import time
 import traceback
-import webbrowser
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -126,9 +124,81 @@ def _ensure_local_venv() -> None:
     sys.exit(completed.returncode)
 
 
-def _open_browser(host: str, port: int) -> None:
-    time.sleep(2.5)
-    webbrowser.open_new_tab(f"http://{host}:{port}/docs")
+def _powershell(command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _looks_like_project_server(pid: int) -> bool:
+    completed = _powershell(
+        f"$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; "
+        f"if ($null -eq $p) {{ '' }} else {{ \"$($p.Name)`n$($p.CommandLine)\" }}"
+    )
+    if completed.returncode != 0:
+        return False
+
+    output = completed.stdout.strip().lower()
+    if not output:
+        return False
+
+    project_markers = (
+        str(PROJECT_DIR).lower(),
+        str(PROJECT_DIR / "run.py").lower(),
+        "app.main:app",
+        "uoshmagisterapi",
+    )
+    return any(marker in output for marker in project_markers)
+
+
+def _kill_process_tree(pid: int) -> None:
+    subprocess.run(
+        ["taskkill", "/PID", str(pid), "/T", "/F"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def _stop_existing_servers(port: int) -> None:
+    completed = subprocess.run(
+        ["netstat", "-ano", "-p", "tcp"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return
+
+    pids: set[int] = set()
+    port_suffix = f":{port}"
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if "LISTENING" not in line.upper():
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        local_address = parts[1]
+        pid_text = parts[-1]
+        if not local_address.endswith(port_suffix):
+            continue
+        if not pid_text.isdigit():
+            continue
+        pid = int(pid_text)
+        if pid == os.getpid():
+            continue
+        pids.add(pid)
+
+    for pid in pids:
+        if _looks_like_project_server(pid):
+            _kill_process_tree(pid)
+
+    if pids:
+        time.sleep(1)
 
 
 def main() -> None:
@@ -159,12 +229,14 @@ def main() -> None:
     host = settings.api_host
     port = settings.api_port
 
+    _stop_existing_servers(port)
+
     print(BANNER)
     print(f"UOSHMagisterAPI -> http://{host}:{port}/docs")
     print("Use /ui for the browser dashboard.")
+    print("Open the URL manually; the launcher keeps this console in the foreground.")
     print(f"Python: {sys.executable}")
 
-    threading.Thread(target=_open_browser, args=(host, port), daemon=True).start()
     uvicorn.run("app.main:app", host=host, port=port, reload=False, log_level="info")
 
 
